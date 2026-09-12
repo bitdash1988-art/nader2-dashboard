@@ -1,9 +1,13 @@
 const BASE = "https://api-demo.bybit.com";
+const RECV_WINDOW = "10000";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json", "cache-control": "no-store" },
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    },
   });
 }
 
@@ -15,136 +19,438 @@ async function hmac(secret, message) {
     false,
     ["sign"]
   );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
-  return Array.from(new Uint8Array(sig))
+
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(message)
+  );
+
+  return Array.from(new Uint8Array(signature))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
-async function serverTime() {
-  const r = await fetch(`${BASE}/v5/market/time`, { cache: "no-store" });
-  const d = await r.json();
-  if (d.retCode !== 0) throw new Error("BYBIT_TIME_FAILED");
-  return Number(d.time);
+async function readJson(response, label) {
+  const text = await response.text();
+
+  if (!text) {
+    throw new Error(`${label}_EMPTY_RESPONSE`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      `${label}_INVALID_JSON:${text.slice(0, 200).replace(/\s+/g, " ")}`
+    );
+  }
+}
+
+async function publicGet(path, params = {}) {
+  const query = new URLSearchParams(params).toString();
+
+  const response = await fetch(
+    `${BASE}${path}${query ? `?${query}` : ""}`,
+    {
+      cache: "no-store",
+      headers: {
+        accept: "application/json",
+      },
+    }
+  );
+
+  return readJson(response, "BYBIT_PUBLIC");
+}
+
+async function timestamp() {
+  /*
+   * Vercel server clocks are synchronized.
+   * We deliberately avoid depending on /v5/market/time here because
+   * that endpoint was the source of the previous parsing failure.
+   */
+  return Date.now();
 }
 
 async function privateGet(path, params, key, secret) {
-  const recv = "10000";
-  const ts = await serverTime();
+  const ts = await timestamp();
   const query = new URLSearchParams(params).toString();
-  const sign = await hmac(secret, `${ts}${key}${recv}${query}`);
-  const r = await fetch(`${BASE}${path}?${query}`, {
-    cache: "no-store",
-    headers: {
-      "X-BAPI-API-KEY": key,
-      "X-BAPI-TIMESTAMP": String(ts),
-      "X-BAPI-SIGN": sign,
-      "X-BAPI-RECV-WINDOW": recv,
-      "X-BAPI-SIGN-TYPE": "2",
-    },
-  });
-  return r.json();
+
+  const signature = await hmac(
+    secret,
+    `${ts}${key}${RECV_WINDOW}${query}`
+  );
+
+  const response = await fetch(
+    `${BASE}${path}?${query}`,
+    {
+      cache: "no-store",
+      headers: {
+        accept: "application/json",
+        "X-BAPI-API-KEY": key,
+        "X-BAPI-TIMESTAMP": String(ts),
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "X-BAPI-SIGN-TYPE": "2",
+      },
+    }
+  );
+
+  return readJson(response, "BYBIT_PRIVATE_GET");
 }
 
 async function privatePost(path, body, key, secret) {
-  const recv = "10000";
-  const ts = await serverTime();
+  const ts = await timestamp();
   const text = JSON.stringify(body);
-  const sign = await hmac(secret, `${ts}${key}${recv}${text}`);
-  const r = await fetch(`${BASE}${path}`, {
+
+  const signature = await hmac(
+    secret,
+    `${ts}${key}${RECV_WINDOW}${text}`
+  );
+
+  const response = await fetch(`${BASE}${path}`, {
     method: "POST",
     cache: "no-store",
     headers: {
       "content-type": "application/json",
+      accept: "application/json",
       "X-BAPI-API-KEY": key,
       "X-BAPI-TIMESTAMP": String(ts),
-      "X-BAPI-SIGN": sign,
-      "X-BAPI-RECV-WINDOW": recv,
+      "X-BAPI-SIGN": signature,
+      "X-BAPI-RECV-WINDOW": RECV_WINDOW,
       "X-BAPI-SIGN-TYPE": "2",
     },
     body: text,
   });
-  return r.json();
+
+  return readJson(response, "BYBIT_PRIVATE_POST");
 }
 
 async function handle(req) {
+  /*
+   * HARD DEMO-ONLY GUARD
+   */
   if ((process.env.BYBIT_DEMO || "").toLowerCase() !== "true") {
-    return json({ ok: false, error: "DEMO_GUARD_BLOCKED" }, 403);
+    return json(
+      {
+        ok: false,
+        error: "DEMO_GUARD_BLOCKED",
+      },
+      403
+    );
   }
 
   try {
     const isPost = req.method === "POST";
-    const body = isPost ? await req.json().catch(() => ({})) : {};
-    const url = new URL(req.url);
-    const action = String(body.action || url.searchParams.get("action") || "health");
 
+    const body = isPost
+      ? await req.json().catch(() => ({}))
+      : {};
+
+    const url = new URL(req.url);
+
+    const action = String(
+      body.action ||
+        url.searchParams.get("action") ||
+        "health"
+    );
+
+    /*
+     * HEALTH
+     */
     if (action === "health") {
       return json({
         ok: true,
         mode: "DEMO",
-        base_url: BASE,
         demo_guard: true,
-        server_time: await serverTime(),
+        base_url: BASE,
+        timestamp: Date.now(),
       });
     }
 
     const key = process.env.BYBIT_API_KEY || "";
     const secret = process.env.BYBIT_API_SECRET || "";
-    if (!key || !secret) return json({ ok: false, error: "BYBIT_SECRETS_MISSING" }, 500);
 
+    if (!key || !secret) {
+      return json(
+        {
+          ok: false,
+          error: "BYBIT_SECRETS_MISSING",
+        },
+        500
+      );
+    }
+
+    /*
+     * BALANCE
+     */
     if (action === "balance") {
+      const result = await privateGet(
+        "/v5/account/wallet-balance",
+        {
+          accountType: "UNIFIED",
+        },
+        key,
+        secret
+      );
+
       return json({
         mode: "DEMO",
-        ...(await privateGet("/v5/account/wallet-balance", { accountType: "UNIFIED" }, key, secret)),
+        ...result,
       });
     }
 
+    /*
+     * TICKER
+     */
     if (action === "ticker") {
-      const category = String(body.category || url.searchParams.get("category") || "spot");
-      const symbol = String(body.symbol || url.searchParams.get("symbol") || "BTCUSDT").toUpperCase();
-      const r = await fetch(
-        `${BASE}/v5/market/tickers?category=${encodeURIComponent(category)}&symbol=${encodeURIComponent(symbol)}`,
-        { cache: "no-store" }
+      const category = String(
+        body.category ||
+          url.searchParams.get("category") ||
+          "spot"
       );
-      return json({ mode: "DEMO", ...(await r.json()) });
+
+      const symbol = String(
+        body.symbol ||
+          url.searchParams.get("symbol") ||
+          "BTCUSDT"
+      ).toUpperCase();
+
+      const result = await publicGet(
+        "/v5/market/tickers",
+        {
+          category,
+          symbol,
+        }
+      );
+
+      return json({
+        mode: "DEMO",
+        ...result,
+      });
     }
 
+    /*
+     * INSTRUMENT INFO
+     */
+    if (action === "instrument") {
+      const category = String(
+        body.category || "spot"
+      );
+
+      const symbol = String(
+        body.symbol || "BTCUSDT"
+      ).toUpperCase();
+
+      const result = await publicGet(
+        "/v5/market/instruments-info",
+        {
+          category,
+          symbol,
+        }
+      );
+
+      return json({
+        mode: "DEMO",
+        ...result,
+      });
+    }
+
+    /*
+     * CREATE DEMO ORDER
+     */
     if (action === "create_demo_order") {
-      const category = String(body.category || "spot");
-      const symbol = String(body.symbol || "BTCUSDT").toUpperCase();
-      const side = String(body.side || "Buy");
-      const orderType = String(body.orderType || "Market");
-      const qty = String(body.qty || "");
-      if (!qty || !/^(Buy|Sell)$/.test(side)) return json({ ok: false, error: "INVALID_ORDER" }, 400);
-      const p = { category, symbol, side, orderType, qty };
-      if (body.price != null) p.price = String(body.price);
-      if (body.timeInForce != null) p.timeInForce = String(body.timeInForce);
-      return json({ mode: "DEMO", ...(await privatePost("/v5/order/create", p, key, secret)) });
-    }
+      const category = String(
+        body.category || "spot"
+      );
 
-    if (action === "order_status") {
-      const category = String(body.category || "spot");
-      const p = { category };
-      if (body.orderId) p.orderId = String(body.orderId);
-      else if (body.orderLinkId) p.orderLinkId = String(body.orderLinkId);
-      else return json({ ok: false, error: "ORDER_ID_REQUIRED" }, 400);
-      return json({ mode: "DEMO", ...(await privateGet("/v5/order/realtime", p, key, secret)) });
-    }
+      const symbol = String(
+        body.symbol || "BTCUSDT"
+      ).toUpperCase();
 
-    if (action === "cancel_demo_order") {
-      const p = {
-        category: String(body.category || "spot"),
-        symbol: String(body.symbol || "BTCUSDT").toUpperCase(),
+      const side = String(
+        body.side || "Buy"
+      );
+
+      const orderType = String(
+        body.orderType || "Market"
+      );
+
+      const qty = String(
+        body.qty || ""
+      );
+
+      if (!qty) {
+        return json(
+          {
+            ok: false,
+            error: "QTY_REQUIRED",
+          },
+          400
+        );
+      }
+
+      if (!/^(Buy|Sell)$/.test(side)) {
+        return json(
+          {
+            ok: false,
+            error: "INVALID_SIDE",
+          },
+          400
+        );
+      }
+
+      if (!/^(Market|Limit)$/.test(orderType)) {
+        return json(
+          {
+            ok: false,
+            error: "INVALID_ORDER_TYPE",
+          },
+          400
+        );
+      }
+
+      const order = {
+        category,
+        symbol,
+        side,
+        orderType,
+        qty,
       };
-      if (body.orderId) p.orderId = String(body.orderId);
-      else if (body.orderLinkId) p.orderLinkId = String(body.orderLinkId);
-      else return json({ ok: false, error: "ORDER_ID_REQUIRED" }, 400);
-      return json({ mode: "DEMO", ...(await privatePost("/v5/order/cancel", p, key, secret)) });
+
+      if (body.price != null) {
+        order.price = String(body.price);
+      }
+
+      if (body.timeInForce != null) {
+        order.timeInForce = String(
+          body.timeInForce
+        );
+      }
+
+      const result = await privatePost(
+        "/v5/order/create",
+        order,
+        key,
+        secret
+      );
+
+      return json({
+        mode: "DEMO",
+        ...result,
+      });
     }
 
-    return json({ ok: false, error: "UNKNOWN_ACTION" }, 400);
-  } catch (e) {
-    return json({ ok: false, error: e instanceof Error ? e.message : "INTERNAL_ERROR" }, 500);
+    /*
+     * ORDER STATUS
+     */
+    if (action === "order_status") {
+      const category = String(
+        body.category || "spot"
+      );
+
+      const params = {
+        category,
+      };
+
+      if (body.orderId) {
+        params.orderId = String(
+          body.orderId
+        );
+      } else if (body.orderLinkId) {
+        params.orderLinkId = String(
+          body.orderLinkId
+        );
+      } else {
+        return json(
+          {
+            ok: false,
+            error: "ORDER_ID_REQUIRED",
+          },
+          400
+        );
+      }
+
+      const result = await privateGet(
+        "/v5/order/realtime",
+        params,
+        key,
+        secret
+      );
+
+      return json({
+        mode: "DEMO",
+        ...result,
+      });
+    }
+
+    /*
+     * CANCEL DEMO ORDER
+     */
+    if (action === "cancel_demo_order") {
+      const category = String(
+        body.category || "spot"
+      );
+
+      const symbol = String(
+        body.symbol || "BTCUSDT"
+      ).toUpperCase();
+
+      const params = {
+        category,
+        symbol,
+      };
+
+      if (body.orderId) {
+        params.orderId = String(
+          body.orderId
+        );
+      } else if (body.orderLinkId) {
+        params.orderLinkId = String(
+          body.orderLinkId
+        );
+      } else {
+        return json(
+          {
+            ok: false,
+            error: "ORDER_ID_REQUIRED",
+          },
+          400
+        );
+      }
+
+      const result = await privatePost(
+        "/v5/order/cancel",
+        params,
+        key,
+        secret
+      );
+
+      return json({
+        mode: "DEMO",
+        ...result,
+      });
+    }
+
+    return json(
+      {
+        ok: false,
+        error: "UNKNOWN_ACTION",
+        action,
+      },
+      400
+    );
+  } catch (error) {
+    return json(
+      {
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "INTERNAL_ERROR",
+      },
+      500
+    );
   }
 }
 
